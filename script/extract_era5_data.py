@@ -18,8 +18,23 @@ DEFAULT_END_YEAR = 2024
 DEFAULT_CHUNK_DAYS = 4
 DEFAULT_RETRY_DELAY_SECONDS = 30
 DEFAULT_MAX_RETRIES = 3
+DEFAULT_VARIABLE_SET = "core_local_climate"
 
-VARIABLES = [
+CORE_LOCAL_CLIMATE_VARIABLES = [
+    "2m_dewpoint_temperature",
+    "2m_temperature",
+    "10m_u_component_of_wind",
+    "10m_v_component_of_wind",
+    "surface_solar_radiation_downwards",
+]
+
+SURFACE_PLUS_OBSERVED_GAPS_VARIABLES = [
+    *CORE_LOCAL_CLIMATE_VARIABLES,
+    "surface_pressure",
+    "total_precipitation",
+]
+
+LEGACY_FULL_CATALOG_VARIABLES = [
     "2m_dewpoint_temperature",
     "2m_temperature",
     "skin_temperature",
@@ -82,6 +97,27 @@ VARIABLES = [
     "type_of_low_vegetation",
 ]
 
+VARIABLE_SETS = {
+    "core_local_climate": CORE_LOCAL_CLIMATE_VARIABLES,
+    "surface_plus_observed_gaps": SURFACE_PLUS_OBSERVED_GAPS_VARIABLES,
+    "legacy_full_catalog": LEGACY_FULL_CATALOG_VARIABLES,
+}
+
+VARIABLE_SET_DESCRIPTIONS = {
+    "core_local_climate": (
+        "Conjunto minimo para clima local de superficie com apoio de IAG + INMET. "
+        "Mantem somente temperatura, umidade termodinamica, vento vetorial e radiacao."
+    ),
+    "surface_plus_observed_gaps": (
+        "Extende o conjunto minimo com pressao e precipitacao para cenarios de "
+        "gap filling ou estudos mais dependentes dessas duas series."
+    ),
+    "legacy_full_catalog": (
+        "Replica a lista historica completa do script, incluindo variaveis de lago, "
+        "neve, solo, vegetacao e mascaras estaticas."
+    ),
+}
+
 TIMES = [f"{hour:02d}:00" for hour in range(24)]
 
 
@@ -131,9 +167,9 @@ class ChunkJob:
             "filename": self.filename,
         }
 
-    def build_request(self) -> dict[str, Any]:
+    def build_request(self, variables: list[str]) -> dict[str, Any]:
         return {
-            "variable": VARIABLES,
+            "variable": variables,
             "year": f"{self.year:04d}",
             "month": f"{self.month:02d}",
             "day": self.days,
@@ -153,6 +189,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-year", type=int, default=DEFAULT_START_YEAR)
     parser.add_argument("--end-year", type=int, default=DEFAULT_END_YEAR)
     parser.add_argument("--chunk-days", type=int, default=DEFAULT_CHUNK_DAYS)
+    parser.add_argument(
+        "--variable-set",
+        choices=sorted(VARIABLE_SETS),
+        default=DEFAULT_VARIABLE_SET,
+        help=(
+            "Preset de variaveis do ERA5-Land. "
+            f"O padrao e '{DEFAULT_VARIABLE_SET}'."
+        ),
+    )
+    parser.add_argument(
+        "--list-variable-sets",
+        action="store_true",
+        help="Lista os presets de variaveis disponiveis e encerra.",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -301,6 +351,7 @@ def load_log_tail(log_path: Path, limit: int = 5) -> list[dict[str, Any]]:
 def build_state(
     *,
     args: argparse.Namespace,
+    variables: list[str],
     output_dir: Path,
     log_path: Path,
     total_jobs: int,
@@ -319,6 +370,8 @@ def build_state(
             "end_year": args.end_year,
             "chunk_days": args.chunk_days,
         },
+        "variable_set": args.variable_set,
+        "variables": variables,
         "output_dir": str(output_dir),
         "log_file": str(log_path),
         "progress": {
@@ -348,6 +401,7 @@ def summarize_jobs(jobs: list[ChunkJob], output_dir: Path) -> tuple[int, ChunkJo
 def print_status(
     *,
     args: argparse.Namespace,
+    variables: list[str],
     output_dir: Path,
     state_path: Path,
     log_path: Path,
@@ -360,6 +414,8 @@ def print_status(
     print(f"Dataset: {DATASET}")
     print(f"Periodo: {args.start_year}..{args.end_year}")
     print(f"Lote de dias: {args.chunk_days}")
+    print(f"Preset de variaveis: {args.variable_set}")
+    print(f"Total de variaveis: {len(variables)}")
     print(f"Diretorio de saida: {output_dir}")
     print(f"Arquivo de estado: {state_path}")
     print(f"Arquivo de log: {log_path}")
@@ -427,6 +483,7 @@ def download_job(
     *,
     client: Any,
     job: ChunkJob,
+    variables: list[str],
     output_dir: Path,
     log_path: Path,
     max_retries: int,
@@ -451,7 +508,7 @@ def download_job(
         )
 
         try:
-            result = client.retrieve(DATASET, job.build_request())
+            result = client.retrieve(DATASET, job.build_request(variables))
             result.download(str(partial_path))
 
             if not partial_path.exists() or partial_path.stat().st_size == 0:
@@ -497,6 +554,16 @@ def download_job(
 
 def main() -> int:
     args = parse_args()
+    variables = list(VARIABLE_SETS[args.variable_set])
+
+    if args.list_variable_sets:
+        for name in sorted(VARIABLE_SETS):
+            print(f"{name}: {VARIABLE_SET_DESCRIPTIONS[name]}")
+            for variable in VARIABLE_SETS[name]:
+                print(f"  - {variable}")
+            print()
+        return 0
+
     output_dir = args.output_dir.resolve()
     state_path, log_path = resolve_state_paths(
         output_dir=output_dir,
@@ -508,6 +575,7 @@ def main() -> int:
     if args.status:
         print_status(
             args=args,
+            variables=variables,
             output_dir=output_dir,
             state_path=state_path,
             log_path=log_path,
@@ -529,6 +597,7 @@ def main() -> int:
             print(f"Destino: {next_pending.output_path(output_dir)}")
         else:
             print("Nao ha lotes pendentes.")
+        print(f"Preset de variaveis: {args.variable_set} ({len(variables)} variaveis)")
         return 0
 
     last_completed_job: ChunkJob | None = None
@@ -547,6 +616,7 @@ def main() -> int:
         state_path,
         build_state(
             args=args,
+            variables=variables,
             output_dir=output_dir,
             log_path=log_path,
             total_jobs=len(jobs),
@@ -573,6 +643,7 @@ def main() -> int:
                 state_path,
                 build_state(
                     args=args,
+                    variables=variables,
                     output_dir=output_dir,
                     log_path=log_path,
                     total_jobs=len(jobs),
@@ -587,6 +658,7 @@ def main() -> int:
             state_path,
             build_state(
                 args=args,
+                variables=variables,
                 output_dir=output_dir,
                 log_path=log_path,
                 total_jobs=len(jobs),
@@ -601,6 +673,7 @@ def main() -> int:
             download_job(
                 client=client,
                 job=job,
+                variables=variables,
                 output_dir=output_dir,
                 log_path=log_path,
                 max_retries=args.max_retries,
@@ -611,6 +684,7 @@ def main() -> int:
                 state_path,
                 build_state(
                     args=args,
+                    variables=variables,
                     output_dir=output_dir,
                     log_path=log_path,
                     total_jobs=len(jobs),
@@ -639,6 +713,7 @@ def main() -> int:
                 state_path,
                 build_state(
                     args=args,
+                    variables=variables,
                     output_dir=output_dir,
                     log_path=log_path,
                     total_jobs=len(jobs),
@@ -669,6 +744,7 @@ def main() -> int:
             state_path,
             build_state(
                 args=args,
+                variables=variables,
                 output_dir=output_dir,
                 log_path=log_path,
                 total_jobs=len(jobs),
@@ -686,6 +762,7 @@ def main() -> int:
         state_path,
         build_state(
             args=args,
+            variables=variables,
             output_dir=output_dir,
             log_path=log_path,
             total_jobs=len(jobs),
