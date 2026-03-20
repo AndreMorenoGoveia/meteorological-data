@@ -6,6 +6,11 @@ from __future__ import annotations
 import argparse
 import calendar
 import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,10 +20,12 @@ from typing import Any, Iterable
 DATASET = "reanalysis-era5-land"
 DEFAULT_START_YEAR = 2020
 DEFAULT_END_YEAR = 2024
-DEFAULT_CHUNK_DAYS = 4
+DEFAULT_CHUNK_DAYS = 31
 DEFAULT_RETRY_DELAY_SECONDS = 30
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_VARIABLE_SET = "core_local_climate"
+DEFAULT_REQUEST_OFFSET_SECONDS = 30
+DEFAULT_MAX_PARALLEL_REQUESTS = 10
 
 CORE_LOCAL_CLIMATE_VARIABLES = [
     "2m_dewpoint_temperature",
@@ -259,6 +266,50 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Mostra o primeiro lote pendente e encerra sem chamar a API.",
     )
+    parser.add_argument(
+        "--request-offset-seconds",
+        type=int,
+        default=DEFAULT_REQUEST_OFFSET_SECONDS,
+        help=(
+            "Intervalo minimo entre o disparo de novos workers. "
+            f"O padrao e {DEFAULT_REQUEST_OFFSET_SECONDS}s."
+        ),
+    )
+    parser.add_argument(
+        "--max-parallel-requests",
+        type=int,
+        default=DEFAULT_MAX_PARALLEL_REQUESTS,
+        help=(
+            "Numero maximo de workers simultaneos. "
+            f"O padrao e {DEFAULT_MAX_PARALLEL_REQUESTS}."
+        ),
+    )
+    parser.add_argument(
+        "--terminal-command",
+        default="auto",
+        help=(
+            "Comando para abrir um terminal por worker. "
+            "Use 'auto' para autodetectar, 'none' para rodar sem terminal, "
+            "ou um template com {command}."
+        ),
+    )
+    parser.add_argument(
+        "--worker",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--worker-job",
+        nargs=4,
+        type=int,
+        metavar=("YEAR", "MONTH", "DAY_START", "DAY_END"),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
 
     if args.start_year > args.end_year:
@@ -271,6 +322,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--retry-delay-seconds nao pode ser negativo.")
     if args.sleep_between_requests < 0:
         parser.error("--sleep-between-requests nao pode ser negativo.")
+    if args.request_offset_seconds < 0:
+        parser.error("--request-offset-seconds nao pode ser negativo.")
+    if args.max_parallel_requests < 1:
+        parser.error("--max-parallel-requests precisa ser maior que zero.")
+    if args.worker and args.worker_job is None:
+        parser.error("--worker exige --worker-job YEAR MONTH DAY_START DAY_END.")
 
     return args
 
@@ -300,6 +357,18 @@ def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+def meta_dir(output_dir: Path) -> Path:
+    return output_dir / "_meta"
+
+
+def claim_path(output_dir: Path, job: ChunkJob) -> Path:
+    return meta_dir(output_dir) / "claims" / f"{job.key}.json"
+
+
+def result_path(output_dir: Path, job: ChunkJob) -> Path:
+    return meta_dir(output_dir) / "results" / f"{job.key}.json"
+
+
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     ensure_parent(path)
     tmp_path = path.with_name(f"{path.name}.tmp")
@@ -321,6 +390,113 @@ def load_json(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def is_pid_running(pid: int | None) -> bool:
+    if pid is None or pid <= 0:
+        return False
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def build_claim_payload(job: ChunkJob, *, status: str, pid: int) -> dict[str, Any]:
+    return {
+        "job": job.to_dict(),
+        "pid": pid,
+        "status": status,
+        "updated_at": utc_now(),
+        "argv": sys.argv,
+    }
+
+
+def claim_is_active(payload: dict[str, Any]) -> bool:
+    return payload.get("status") in {"launching", "running"} and is_pid_running(
+        payload.get("pid")
+    )
+
+
+def remove_claim_if_stale(output_dir: Path, job: ChunkJob) -> bool:
+    path = claim_path(output_dir, job)
+    payload = load_json(path)
+    if not payload:
+        return False
+    if claim_is_active(payload):
+        return False
+    if job.output_path(output_dir).exists():
+        return False
+    path.unlink(missing_ok=True)
+    return True
+
+
+def reserve_job_claim(output_dir: Path, job: ChunkJob) -> bool:
+    path = claim_path(output_dir, job)
+    ensure_parent(path)
+
+    while True:
+        if job.output_path(output_dir).exists():
+            return False
+
+        try:
+            with path.open("x", encoding="utf-8") as file_handle:
+                json.dump(
+                    build_claim_payload(job, status="launching", pid=os.getpid()),
+                    file_handle,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+                file_handle.write("\n")
+            return True
+        except FileExistsError:
+            if not remove_claim_if_stale(output_dir, job):
+                return False
+
+
+def acquire_worker_claim(output_dir: Path, job: ChunkJob) -> bool:
+    path = claim_path(output_dir, job)
+    ensure_parent(path)
+    payload = build_claim_payload(job, status="running", pid=os.getpid())
+
+    existing_payload = load_json(path)
+    if existing_payload:
+        if claim_is_active(existing_payload):
+            existing_pid = existing_payload.get("pid")
+            if existing_pid != os.getpid() and existing_payload.get("status") == "running":
+                return False
+        elif not job.output_path(output_dir).exists():
+            path.unlink(missing_ok=True)
+
+    write_json(path, payload)
+    return True
+
+
+def release_job_claim(output_dir: Path, job: ChunkJob) -> None:
+    claim_path(output_dir, job).unlink(missing_ok=True)
+
+
+def write_result(
+    output_dir: Path,
+    job: ChunkJob,
+    *,
+    run_id: str | None,
+    status: str,
+    message: str | None = None,
+) -> None:
+    payload = {
+        "job": job.to_dict(),
+        "pid": os.getpid(),
+        "run_id": run_id,
+        "status": status,
+        "updated_at": utc_now(),
+    }
+    if message:
+        payload["message"] = message
+    write_json(result_path(output_dir, job), payload)
 
 
 def iter_jobs(start_year: int, end_year: int, chunk_days: int) -> Iterable[ChunkJob]:
@@ -354,21 +530,32 @@ def build_state(
     variables: list[str],
     output_dir: Path,
     log_path: Path,
+    run_id: str | None,
     total_jobs: int,
     completed_jobs: int,
+    active_jobs: list[ChunkJob] | None = None,
+    failed_jobs: list[ChunkJob] | None = None,
     last_started: ChunkJob | None = None,
     last_completed: ChunkJob | None = None,
     last_error: dict[str, Any] | None = None,
     status: str,
 ) -> dict[str, Any]:
+    active_jobs = active_jobs or []
+    failed_jobs = failed_jobs or []
     return {
         "dataset": DATASET,
+        "run_id": run_id,
         "updated_at": utc_now(),
         "status": status,
         "range": {
             "start_year": args.start_year,
             "end_year": args.end_year,
             "chunk_days": args.chunk_days,
+        },
+        "parallelism": {
+            "max_parallel_requests": args.max_parallel_requests,
+            "request_offset_seconds": args.request_offset_seconds,
+            "terminal_command": args.terminal_command,
         },
         "variable_set": args.variable_set,
         "variables": variables,
@@ -377,25 +564,81 @@ def build_state(
         "progress": {
             "completed_jobs": completed_jobs,
             "total_jobs": total_jobs,
-            "pending_jobs": total_jobs - completed_jobs,
+            "active_jobs": len(active_jobs),
+            "failed_jobs": len(failed_jobs),
+            "pending_jobs": total_jobs - completed_jobs - len(active_jobs) - len(failed_jobs),
         },
+        "active_jobs": [job.to_dict() for job in active_jobs],
+        "failed_jobs": [job.to_dict() for job in failed_jobs],
         "last_started": last_started.to_dict() if last_started else None,
         "last_completed": last_completed.to_dict() if last_completed else None,
         "last_error": last_error,
     }
 
 
-def summarize_jobs(jobs: list[ChunkJob], output_dir: Path) -> tuple[int, ChunkJob | None]:
+def load_run_failures(
+    jobs: list[ChunkJob],
+    output_dir: Path,
+    run_id: str | None,
+) -> dict[str, dict[str, Any]]:
+    if not run_id:
+        return {}
+
+    failures: dict[str, dict[str, Any]] = {}
+    for job in jobs:
+        payload = load_json(result_path(output_dir, job))
+        if (
+            payload.get("run_id") == run_id
+            and payload.get("status") in {"failed", "interrupted"}
+        ):
+            failures[job.key] = payload
+    return failures
+
+
+def summarize_jobs(
+    jobs: list[ChunkJob],
+    output_dir: Path,
+    *,
+    overwrite: bool,
+    run_id: str | None = None,
+) -> tuple[int, list[ChunkJob], list[ChunkJob], ChunkJob | None]:
     completed = 0
+    active_jobs: list[ChunkJob] = []
+    failed_jobs: list[ChunkJob] = []
     next_pending = None
+    failures = load_run_failures(jobs, output_dir, run_id)
 
     for job in jobs:
-        if job.output_path(output_dir).exists():
+        output_exists = job.output_path(output_dir).exists()
+        job_result = load_json(result_path(output_dir, job))
+        if (
+            overwrite
+            and run_id
+            and job_result.get("run_id") == run_id
+            and job_result.get("status") == "success"
+        ):
             completed += 1
-        elif next_pending is None:
+            continue
+
+        if output_exists and not overwrite:
+            completed += 1
+            continue
+
+        claim_payload = load_json(claim_path(output_dir, job))
+        if claim_payload and claim_is_active(claim_payload):
+            active_jobs.append(job)
+            continue
+        if claim_payload:
+            remove_claim_if_stale(output_dir, job)
+
+        if job.key in failures:
+            failed_jobs.append(job)
+            continue
+
+        if next_pending is None:
             next_pending = job
 
-    return completed, next_pending
+    return completed, active_jobs, failed_jobs, next_pending
 
 
 def print_status(
@@ -407,8 +650,13 @@ def print_status(
     log_path: Path,
     jobs: list[ChunkJob],
 ) -> None:
-    completed_jobs, next_pending = summarize_jobs(jobs, output_dir)
     state = load_json(state_path)
+    completed_jobs, active_jobs, failed_jobs, next_pending = summarize_jobs(
+        jobs,
+        output_dir,
+        overwrite=args.overwrite,
+        run_id=state.get("run_id"),
+    )
     recent_events = load_log_tail(log_path)
 
     print(f"Dataset: {DATASET}")
@@ -420,7 +668,9 @@ def print_status(
     print(f"Arquivo de estado: {state_path}")
     print(f"Arquivo de log: {log_path}")
     print(f"Concluidos: {completed_jobs}/{len(jobs)}")
-    print(f"Pendentes: {len(jobs) - completed_jobs}")
+    print(f"Ativos: {len(active_jobs)}")
+    print(f"Falhos no run atual: {len(failed_jobs)}")
+    print(f"Pendentes: {len(jobs) - completed_jobs - len(active_jobs) - len(failed_jobs)}")
 
     if state:
         print(f"Ultimo status salvo: {state.get('status', 'desconhecido')}")
@@ -552,6 +802,376 @@ def download_job(
     raise RuntimeError("Fluxo de retries terminou em estado invalido.")
 
 
+def build_run_id() -> str:
+    return f"{utc_now()}-pid{os.getpid()}"
+
+
+def parse_worker_job(worker_job: list[int] | None) -> ChunkJob:
+    if worker_job is None:
+        raise SystemExit("Modo worker sem lote definido.")
+    year, month, day_start, day_end = worker_job
+    return ChunkJob(year=year, month=month, day_start=day_start, day_end=day_end)
+
+
+def find_last_completed_job(jobs: list[ChunkJob], output_dir: Path) -> ChunkJob | None:
+    last_completed = None
+    for job in jobs:
+        if job.output_path(output_dir).exists():
+            last_completed = job
+    return last_completed
+
+
+def build_worker_command(
+    args: argparse.Namespace,
+    job: ChunkJob,
+    *,
+    output_dir: Path,
+    state_path: Path,
+    log_path: Path,
+    run_id: str,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--worker",
+        "--worker-job",
+        str(job.year),
+        str(job.month),
+        str(job.day_start),
+        str(job.day_end),
+        "--run-id",
+        run_id,
+        "--start-year",
+        str(args.start_year),
+        "--end-year",
+        str(args.end_year),
+        "--chunk-days",
+        str(args.chunk_days),
+        "--variable-set",
+        args.variable_set,
+        "--output-dir",
+        str(output_dir),
+        "--state-file",
+        str(state_path),
+        "--log-file",
+        str(log_path),
+        "--max-retries",
+        str(args.max_retries),
+        "--retry-delay-seconds",
+        str(args.retry_delay_seconds),
+    ] + (["--overwrite"] if args.overwrite else [])
+
+
+def build_terminal_launch_command(
+    worker_command: list[str],
+    terminal_command: str,
+) -> tuple[list[str], str]:
+    if terminal_command == "none":
+        return worker_command, "background"
+
+    worker_shell_command = " ".join(shlex.quote(part) for part in worker_command)
+    hold_shell_command = (
+        f"{worker_shell_command}; "
+        'exit_code=$?; '
+        'printf "\\nWorker finalizado com status %s\\n" "$exit_code"; '
+        "exec bash"
+    )
+
+    if terminal_command != "auto":
+        if "{command}" not in terminal_command:
+            raise SystemExit("--terminal-command customizado precisa conter {command}.")
+        rendered = terminal_command.format(command=shlex.quote(hold_shell_command))
+        return shlex.split(rendered), "custom"
+
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        return worker_command, "background"
+
+    if shutil.which("x-terminal-emulator"):
+        return ["x-terminal-emulator", "-e", "bash", "-lc", hold_shell_command], "x-terminal-emulator"
+    if shutil.which("gnome-terminal"):
+        return ["gnome-terminal", "--", "bash", "-lc", hold_shell_command], "gnome-terminal"
+    if shutil.which("xterm"):
+        return ["xterm", "-hold", "-e", "bash", "-lc", hold_shell_command], "xterm"
+
+    return worker_command, "background"
+
+
+def launch_worker(
+    *,
+    args: argparse.Namespace,
+    job: ChunkJob,
+    output_dir: Path,
+    state_path: Path,
+    log_path: Path,
+    run_id: str,
+) -> bool:
+    if not reserve_job_claim(output_dir, job):
+        return False
+
+    worker_command = build_worker_command(
+        args,
+        job,
+        output_dir=output_dir,
+        state_path=state_path,
+        log_path=log_path,
+        run_id=run_id,
+    )
+    launch_command, launch_mode = build_terminal_launch_command(
+        worker_command,
+        args.terminal_command,
+    )
+
+    try:
+        subprocess.Popen(
+            launch_command,
+            start_new_session=True,
+            stdout=None if launch_mode != "background" else subprocess.DEVNULL,
+            stderr=None if launch_mode != "background" else subprocess.DEVNULL,
+        )
+    except Exception:
+        release_job_claim(output_dir, job)
+        raise
+
+    log_event(
+        log_path,
+        "worker_launched",
+        job,
+        run_id=run_id,
+        launch_mode=launch_mode,
+        command=worker_command,
+    )
+    return True
+
+
+def run_worker(
+    *,
+    args: argparse.Namespace,
+    variables: list[str],
+    output_dir: Path,
+    log_path: Path,
+) -> int:
+    job = parse_worker_job(args.worker_job)
+    target_path = job.output_path(output_dir)
+
+    if target_path.exists() and not args.overwrite:
+        log_event(log_path, "skipped_existing", job, target_path=str(target_path))
+        write_result(output_dir, job, run_id=args.run_id, status="success")
+        print(f"Lote {job.key} ja concluido em {target_path}.")
+        return 0
+
+    if not acquire_worker_claim(output_dir, job):
+        print(f"Lote {job.key} ja esta em execucao por outro worker.")
+        return 0
+
+    client = create_client()
+
+    try:
+        download_job(
+            client=client,
+            job=job,
+            variables=variables,
+            output_dir=output_dir,
+            log_path=log_path,
+            max_retries=args.max_retries,
+            retry_delay_seconds=args.retry_delay_seconds,
+        )
+    except KeyboardInterrupt:
+        write_result(
+            output_dir,
+            job,
+            run_id=args.run_id,
+            status="interrupted",
+            message="Worker interrompido pelo usuario.",
+        )
+        raise
+    except Exception as exc:
+        write_result(
+            output_dir,
+            job,
+            run_id=args.run_id,
+            status="failed",
+            message=str(exc),
+        )
+        print(f"Falha no lote {job.key}: {exc}")
+        return 1
+    finally:
+        release_job_claim(output_dir, job)
+
+    if not target_path.exists():
+        write_result(
+            output_dir,
+            job,
+            run_id=args.run_id,
+            status="failed",
+            message=f"Arquivo final ausente em {target_path}",
+        )
+        print(f"Lote {job.key} terminou sem gerar arquivo final em {target_path}.")
+        return 1
+
+    write_result(output_dir, job, run_id=args.run_id, status="success")
+    print(f"Lote {job.key} concluido em {target_path}.")
+    return 0
+
+
+def run_scheduler(
+    *,
+    args: argparse.Namespace,
+    variables: list[str],
+    output_dir: Path,
+    state_path: Path,
+    log_path: Path,
+    jobs: list[ChunkJob],
+) -> int:
+    run_id = build_run_id()
+    had_failures = False
+    last_started_job: ChunkJob | None = None
+    last_launch_at: float | None = None
+    launch_delay = max(args.request_offset_seconds, args.sleep_between_requests)
+    completed_jobs = 0
+    active_jobs: list[ChunkJob] = []
+    failed_jobs: list[ChunkJob] = []
+    last_completed_job: ChunkJob | None = None
+    last_error = None
+
+    try:
+        while True:
+            completed_jobs, active_jobs, failed_jobs, next_pending = summarize_jobs(
+                jobs,
+                output_dir,
+                overwrite=args.overwrite,
+                run_id=run_id,
+            )
+            last_completed_job = find_last_completed_job(jobs, output_dir)
+            last_error = None
+
+            if failed_jobs:
+                had_failures = True
+                failure_payload = load_json(result_path(output_dir, failed_jobs[-1]))
+                last_error = {
+                    "job_key": failed_jobs[-1].key,
+                    "error_type": failure_payload.get("status", "failed"),
+                    "message": failure_payload.get("message", ""),
+                    "timestamp": failure_payload.get("updated_at", utc_now()),
+                }
+
+                if not args.continue_on_error and not active_jobs:
+                    write_json(
+                        state_path,
+                        build_state(
+                            args=args,
+                            variables=variables,
+                            output_dir=output_dir,
+                            log_path=log_path,
+                            run_id=run_id,
+                            total_jobs=len(jobs),
+                            completed_jobs=completed_jobs,
+                            active_jobs=active_jobs,
+                            failed_jobs=failed_jobs,
+                            last_started=last_started_job,
+                            last_completed=last_completed_job,
+                            last_error=last_error,
+                            status="failed",
+                        ),
+                    )
+                    print(
+                        f"Falha no lote {failed_jobs[-1].key}. "
+                        f"Consulte {log_path} e rode novamente para retomar."
+                    )
+                    return 1
+
+            if completed_jobs == len(jobs) or (
+                completed_jobs + len(failed_jobs) == len(jobs)
+                and not active_jobs
+                and next_pending is None
+            ):
+                final_status = "completed_with_errors" if had_failures else "completed"
+                write_json(
+                    state_path,
+                    build_state(
+                        args=args,
+                        variables=variables,
+                        output_dir=output_dir,
+                        log_path=log_path,
+                        run_id=run_id,
+                        total_jobs=len(jobs),
+                        completed_jobs=completed_jobs,
+                        active_jobs=active_jobs,
+                        failed_jobs=failed_jobs,
+                        last_started=last_started_job,
+                        last_completed=last_completed_job,
+                        last_error=last_error,
+                        status=final_status,
+                    ),
+                )
+                print(f"Extracao concluida. Arquivos salvos em {output_dir}")
+                return 0 if (not had_failures or args.continue_on_error) else 1
+
+            if (
+                next_pending
+                and (args.continue_on_error or not failed_jobs)
+                and len(active_jobs) < args.max_parallel_requests
+                and (
+                    last_launch_at is None
+                    or time.monotonic() - last_launch_at >= launch_delay
+                )
+            ):
+                if launch_worker(
+                    args=args,
+                    job=next_pending,
+                    output_dir=output_dir,
+                    state_path=state_path,
+                    log_path=log_path,
+                    run_id=run_id,
+                ):
+                    last_started_job = next_pending
+                    last_launch_at = time.monotonic()
+
+            write_json(
+                state_path,
+                build_state(
+                    args=args,
+                    variables=variables,
+                    output_dir=output_dir,
+                    log_path=log_path,
+                    run_id=run_id,
+                    total_jobs=len(jobs),
+                    completed_jobs=completed_jobs,
+                    active_jobs=active_jobs,
+                    failed_jobs=failed_jobs,
+                    last_started=last_started_job,
+                    last_completed=last_completed_job,
+                    last_error=last_error,
+                    status="running",
+                ),
+            )
+            time.sleep(1)
+    except KeyboardInterrupt:
+        write_json(
+            state_path,
+            build_state(
+                args=args,
+                variables=variables,
+                output_dir=output_dir,
+                log_path=log_path,
+                run_id=run_id,
+                total_jobs=len(jobs),
+                completed_jobs=completed_jobs,
+                active_jobs=active_jobs,
+                failed_jobs=failed_jobs,
+                last_started=last_started_job,
+                last_completed=last_completed_job,
+                last_error={
+                    "job_key": last_started_job.key if last_started_job else None,
+                    "error_type": "KeyboardInterrupt",
+                    "message": "Scheduler interrompido pelo usuario.",
+                    "timestamp": utc_now(),
+                },
+                status="interrupted",
+            ),
+        )
+        raise
+
+
 def main() -> int:
     args = parse_args()
     variables = list(VARIABLE_SETS[args.variable_set])
@@ -572,6 +1192,14 @@ def main() -> int:
     )
     jobs = list(iter_jobs(args.start_year, args.end_year, args.chunk_days))
 
+    if args.worker:
+        return run_worker(
+            args=args,
+            variables=variables,
+            output_dir=output_dir,
+            log_path=log_path,
+        )
+
     if args.status:
         print_status(
             args=args,
@@ -583,15 +1211,18 @@ def main() -> int:
         )
         return 0
 
-    if args.overwrite:
-        completed_jobs = 0
-        next_pending = jobs[0] if jobs else None
-    else:
-        completed_jobs, next_pending = summarize_jobs(jobs, output_dir)
+    completed_jobs, active_jobs, failed_jobs, next_pending = summarize_jobs(
+        jobs,
+        output_dir,
+        overwrite=args.overwrite,
+        run_id=None,
+    )
 
     if args.dry_run:
         print(f"Total de lotes: {len(jobs)}")
         print(f"Lotes ja concluidos: {completed_jobs}")
+        print(f"Lotes ativos: {len(active_jobs)}")
+        print(f"Lotes falhos no run atual: {len(failed_jobs)}")
         if next_pending:
             print(f"Primeiro lote pendente: {next_pending.key}")
             print(f"Destino: {next_pending.output_path(output_dir)}")
@@ -600,179 +1231,14 @@ def main() -> int:
         print(f"Preset de variaveis: {args.variable_set} ({len(variables)} variaveis)")
         return 0
 
-    last_completed_job: ChunkJob | None = None
-    had_failures = False
-    state = load_json(state_path)
-    if state.get("last_completed"):
-        completed = state["last_completed"]
-        last_completed_job = ChunkJob(
-            year=completed["year"],
-            month=completed["month"],
-            day_start=completed["day_start"],
-            day_end=completed["day_end"],
-        )
-
-    write_json(
-        state_path,
-        build_state(
-            args=args,
-            variables=variables,
-            output_dir=output_dir,
-            log_path=log_path,
-            total_jobs=len(jobs),
-            completed_jobs=completed_jobs,
-            last_completed=last_completed_job,
-            status="running",
-        ),
+    return run_scheduler(
+        args=args,
+        variables=variables,
+        output_dir=output_dir,
+        state_path=state_path,
+        log_path=log_path,
+        jobs=jobs,
     )
-
-    client = create_client()
-
-    for job in jobs:
-        target_path = job.output_path(output_dir)
-
-        if target_path.exists() and not args.overwrite:
-            last_completed_job = job
-            log_event(
-                log_path,
-                "skipped_existing",
-                job,
-                target_path=str(target_path),
-            )
-            write_json(
-                state_path,
-                build_state(
-                    args=args,
-                    variables=variables,
-                    output_dir=output_dir,
-                    log_path=log_path,
-                    total_jobs=len(jobs),
-                    completed_jobs=completed_jobs,
-                    last_completed=last_completed_job,
-                    status="running",
-                ),
-            )
-            continue
-
-        write_json(
-            state_path,
-            build_state(
-                args=args,
-                variables=variables,
-                output_dir=output_dir,
-                log_path=log_path,
-                total_jobs=len(jobs),
-                completed_jobs=completed_jobs,
-                last_started=job,
-                last_completed=last_completed_job,
-                status="running",
-            ),
-        )
-
-        try:
-            download_job(
-                client=client,
-                job=job,
-                variables=variables,
-                output_dir=output_dir,
-                log_path=log_path,
-                max_retries=args.max_retries,
-                retry_delay_seconds=args.retry_delay_seconds,
-            )
-        except KeyboardInterrupt:
-            write_json(
-                state_path,
-                build_state(
-                    args=args,
-                    variables=variables,
-                    output_dir=output_dir,
-                    log_path=log_path,
-                    total_jobs=len(jobs),
-                    completed_jobs=completed_jobs,
-                    last_started=job,
-                    last_completed=last_completed_job,
-                    last_error={
-                        "job_key": job.key,
-                        "error_type": "KeyboardInterrupt",
-                        "message": "Execucao interrompida pelo usuario.",
-                        "timestamp": utc_now(),
-                    },
-                    status="interrupted",
-                ),
-            )
-            raise
-        except Exception as exc:
-            had_failures = True
-            error_payload = {
-                "job_key": job.key,
-                "error_type": type(exc).__name__,
-                "message": str(exc),
-                "timestamp": utc_now(),
-            }
-            write_json(
-                state_path,
-                build_state(
-                    args=args,
-                    variables=variables,
-                    output_dir=output_dir,
-                    log_path=log_path,
-                    total_jobs=len(jobs),
-                    completed_jobs=completed_jobs,
-                    last_started=job,
-                    last_completed=last_completed_job,
-                    last_error=error_payload,
-                    status="failed",
-                ),
-            )
-
-            if not args.continue_on_error:
-                print(
-                    f"Falha no lote {job.key}. "
-                    f"Consulte {log_path} e rode novamente para retomar."
-                )
-                return 1
-
-            continue
-
-        if not target_path.exists():
-            print(f"Lote {job.key} terminou sem gerar arquivo final em {target_path}.")
-            return 1
-
-        completed_jobs += 1
-        last_completed_job = job
-        write_json(
-            state_path,
-            build_state(
-                args=args,
-                variables=variables,
-                output_dir=output_dir,
-                log_path=log_path,
-                total_jobs=len(jobs),
-                completed_jobs=completed_jobs,
-                last_started=job,
-                last_completed=last_completed_job,
-                status="running",
-            ),
-        )
-
-        if args.sleep_between_requests:
-            time.sleep(args.sleep_between_requests)
-
-    write_json(
-        state_path,
-        build_state(
-            args=args,
-            variables=variables,
-            output_dir=output_dir,
-            log_path=log_path,
-            total_jobs=len(jobs),
-            completed_jobs=completed_jobs,
-            last_completed=last_completed_job,
-            status="completed_with_errors" if had_failures else "completed",
-        ),
-    )
-    print(f"Extracao concluida. Arquivos salvos em {output_dir}")
-    return 0
 
 
 if __name__ == "__main__":
